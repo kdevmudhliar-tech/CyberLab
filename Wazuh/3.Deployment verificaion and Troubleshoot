@@ -1,0 +1,540 @@
+# 24. Deployment Verification and Troubleshooting
+
+> This section documents the actual issues encountered during the deployment of Wazuh on an Apple Silicon M5 system using OrbStack and Docker. Each issue includes the symptoms, root cause, diagnostic process, resolution, and lessons learned.
+
+---
+
+# Issue 1 – Wazuh Docker Image Not Found
+
+## Symptom
+
+During the initial deployment, Docker failed to download the specified image.
+
+Command:
+
+```bash
+docker compose pull
+```
+
+Observed Error:
+
+```text
+Error response from daemon:
+failed to resolve reference
+docker.io/wazuh/wazuh-manager:5.1.0
+
+not found
+```
+
+---
+
+## Root Cause
+
+The Docker Compose file referenced:
+
+```yaml
+image: wazuh/wazuh-manager:5.1.0
+```
+
+At the time of deployment, that image tag was not available from the Docker registry.
+
+This caused Docker to stop before creating any containers.
+
+---
+
+## Investigation
+
+Verify the image tag referenced in:
+
+```text
+docker-compose.yml
+```
+
+Compare it with the version available in the Wazuh repository documentation.
+
+---
+
+## Resolution
+
+Instead of continuing with the unavailable image tag, the deployment switched to the stable **4.14.6** release.
+
+After updating the deployment files, Docker successfully downloaded:
+
+* wazuh-manager:4.14.6
+* wazuh-indexer:4.14.6
+* wazuh-dashboard:4.14.6
+
+---
+
+## Lesson Learned
+
+Always verify Docker image tags before deployment.
+
+Do not assume the newest version is immediately available for every deployment method.
+
+---
+
+# Issue 2 – Missing Certificate Generator
+
+## Symptom
+
+Certificate generation failed.
+
+Command:
+
+```bash
+docker compose -f generate-indexer-certs.yml run --rm generator
+```
+
+Observed Error:
+
+```text
+no such file or directory
+```
+
+---
+
+## Root Cause
+
+The cloned repository did not contain:
+
+```text
+generate-indexer-certs.yml
+```
+
+The repository layout differed from the expected version.
+
+---
+
+## Investigation
+
+Commands used:
+
+```bash
+pwd
+
+find . -maxdepth 2 -type f
+```
+
+This confirmed that the required file was missing.
+
+---
+
+## Resolution
+
+A clean clone of the correct repository version restored:
+
+```text
+generate-indexer-certs.yml
+
+config/certs.yml
+```
+
+Certificate generation then completed successfully.
+
+---
+
+## Lesson Learned
+
+Before troubleshooting Docker, verify the repository contents and branch.
+
+---
+
+# Issue 3 – YAML Validation Errors
+
+## Symptom
+
+Docker Compose refused to start.
+
+Validation Errors Included:
+
+```text
+additional properties 'external', 'name'
+not allowed
+```
+
+and
+
+```text
+found a tab character
+that violates indentation
+```
+
+---
+
+## Root Cause
+
+The Compose file had been modified incorrectly.
+
+Problems included:
+
+* Invalid network syntax
+* Incorrect indentation
+* Tab characters instead of spaces
+
+YAML is indentation-sensitive.
+
+One misplaced tab can invalidate the entire file.
+
+---
+
+## Resolution
+
+The file was edited using VS Code.
+
+Indentation was converted to spaces.
+
+Network configuration was corrected.
+
+Docker Compose validation succeeded.
+
+---
+
+## Lesson Learned
+
+Always use a YAML-aware editor.
+
+Never mix tabs and spaces.
+
+---
+
+# Issue 4 – Certificate Generation Permission Errors
+
+## Symptom
+
+Certificate generation completed partially.
+
+Observed Errors:
+
+```text
+Permission denied
+
+cannot create regular file
+```
+
+---
+
+## Investigation
+
+Verified:
+
+* Current working directory
+* Mounted folders
+* Generated certificate locations
+
+---
+
+## Resolution
+
+Confirmed that the certificate files had been created correctly under:
+
+```text
+config/wazuh_indexer_ssl_certs/
+```
+
+The deployment continued using the generated certificates.
+
+---
+
+## Lesson Learned
+
+Permission warnings do not always indicate deployment failure.
+
+Always verify the output directory before repeating certificate generation.
+
+---
+
+# Issue 5 – Manager Restart Loop
+
+## Symptom
+
+The Dashboard displayed:
+
+Manager
+
+Status:
+
+```text
+Offline
+```
+
+Container inspection showed:
+
+```bash
+docker inspect single-node-wazuh.manager-1 \
+--format='RestartCount={{.RestartCount}}'
+```
+
+Output:
+
+```text
+RestartCount=97
+```
+
+---
+
+## Investigation
+
+The following commands were used:
+
+```bash
+docker compose ps
+
+docker ps
+
+docker logs single-node-wazuh.manager-1
+```
+
+The logs showed Filebeat exiting immediately.
+
+---
+
+# Issue 6 – TLS Certificate Failure
+
+The Manager logs contained:
+
+```text
+Failed reading CA certificate
+
+read /etc/ssl/root-ca.pem
+
+is a directory
+```
+
+This was the key error that explained why the Manager continued restarting.
+
+---
+
+## Diagnostic Process
+
+Check the mounted path inside the container:
+
+```bash
+docker exec single-node-wazuh.manager-1 \
+ls -ld /etc/ssl/root-ca.pem
+```
+
+Output:
+
+```text
+drwxr-xr-x
+```
+
+The expected result should have been:
+
+```text
+-r-------- root-ca.pem
+```
+
+This confirmed that Docker had mounted a **directory** instead of a certificate file.
+
+---
+
+## Investigation on the Host
+
+The Compose file contained:
+
+```yaml
+./config/wazuh_indexer_ssl_certs/root-ca-manager.pem
+
+↓
+
+/etc/ssl/root-ca.pem
+```
+
+Checking the host directory revealed:
+
+```text
+root-ca-manager.pem
+```
+
+was actually a directory rather than a PEM certificate.
+
+---
+
+## Root Cause
+
+Docker bind mounts preserve the host filesystem object.
+
+Because the host path was a directory, Docker mounted it as a directory inside the container.
+
+Filebeat expected:
+
+```text
+/etc/ssl/root-ca.pem
+```
+
+to be a certificate file.
+
+Instead it received:
+
+```text
+Directory
+```
+
+As a result:
+
+* TLS initialization failed
+* Filebeat terminated
+* Manager initialization failed
+* Docker restarted the container repeatedly
+
+---
+
+## Resolution
+
+Remove the incorrect directory.
+
+Recreate:
+
+```text
+root-ca-manager.pem
+```
+
+as a certificate file copied from:
+
+```text
+root-ca.pem
+```
+
+Restart the deployment.
+
+---
+
+## Verification
+
+Command:
+
+```bash
+docker inspect single-node-wazuh.manager-1 \
+--format='RestartCount={{.RestartCount}}'
+```
+
+Output:
+
+```text
+RestartCount=0
+```
+
+Dashboard Status:
+
+```text
+Manager
+
+Online
+
+Version 4.14.6
+```
+
+Deployment successful.
+
+---
+
+# Issue 7 – Dashboard Authentication
+
+Verified Dashboard access through:
+
+```text
+https://localhost
+```
+
+Login succeeded.
+
+Manager status changed from:
+
+```text
+Offline
+```
+
+to
+
+```text
+Online
+```
+
+---
+
+# Final Verification Checklist
+
+The following commands were executed to confirm a healthy deployment.
+
+Running Containers
+
+```bash
+docker ps
+```
+
+Docker Compose
+
+```bash
+docker compose ps
+```
+
+Restart Count
+
+```bash
+docker inspect single-node-wazuh.manager-1 \
+--format='RestartCount={{.RestartCount}}'
+```
+
+Manager Logs
+
+```bash
+docker logs single-node-wazuh.manager-1
+```
+
+Dashboard
+
+```text
+https://localhost
+```
+
+Manager Status
+
+```text
+Online
+```
+
+Indexer
+
+```text
+Healthy
+```
+
+Dashboard
+
+```text
+Healthy
+```
+
+---
+
+# Lessons Learned
+
+The deployment reinforced several engineering principles:
+
+1. Verify image versions before deployment.
+2. Confirm repository contents before running commands.
+3. YAML syntax errors can prevent deployment before containers are created.
+4. TLS certificate paths must reference files, not directories.
+5. Use container logs before attempting reinstallation.
+6. Investigate the root cause rather than repeatedly restarting services.
+7. Validate the deployment after every major change.
+8. Document every issue and its resolution for future reference.
+
+---
+
+# Deployment Outcome
+
+Final Status:
+
+* Wazuh Manager: ✅ Online
+* Wazuh Dashboard: ✅ Online
+* Wazuh Indexer: ✅ Online
+* Docker Containers: ✅ Running
+* Restart Count: ✅ 0
+* Dashboard Access: ✅ Successful
+* TLS Communication: ✅ Operational
+* Platform: Apple Silicon M5
+* Container Runtime: OrbStack
+* Deployment Method: Docker Compose
